@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'dart:async';
 import 'dart:ffi' if (dart.library.io) 'dart:io' show Platform;
+import 'services/vpn_service.dart';
 
 void main() {
   runApp(const MyApp());
@@ -54,29 +55,24 @@ class VPNClientListPage extends StatefulWidget {
 }
 
 class _VPNClientListPageState extends State<VPNClientListPage> {
-  final String backendUrl = 'http://192.168.1.15:8000';
+  final String backendUrl = 'http://192.168.1.12:8000';
   List<VPNClient> clients = [];
   bool loading = false;
-  late OpenVPN openvpn;
   String status = "Disconnected";
   String stage = "Idle";
   int? connectedClientId;
-  Timer? _authTimer;
   bool isAuthenticating = false;
-  String? pendingUsername;
-  String? pendingPassword;
   late SharedPreferences _prefs;
   final NetworkInfo _networkInfo = NetworkInfo();
   String? _currentIpAddress;
+  final VPNService _vpnService = VPNService();
 
   @override
   void initState() {
     super.initState();
     _initPrefs();
     fetchClients();
-    if (Platform.isAndroid) {
-      _initAndroidVPN();
-    }
+    _initVPN();
     _requestNotificationPermission();
     _getCurrentIpAddress();
   }
@@ -85,86 +81,42 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
     _prefs = await SharedPreferences.getInstance();
   }
 
-  void _initAndroidVPN() {
-    openvpn = OpenVPN(
-      onVpnStatusChanged: (data) {
-        print('Raw VPN Status: $data');
-        setState(() {
-          status = data?.toString() ?? "Unknown";
-          final statusStr = status.toLowerCase();
-          
-          if (statusStr.contains('authenticat')) {
-            isAuthenticating = true;
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Authenticating...')),
-            );
-          } else {
-            isAuthenticating = false;
-          }
+  Future<void> _initVPN() async {
+    await _vpnService.initialize();
+    _vpnService.onStatusChanged = (status) {
+      setState(() {
+        this.status = status;
+        if (status.toLowerCase().contains('authenticat')) {
+          isAuthenticating = true;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Authenticating...')),
+          );
+        } else {
+          isAuthenticating = false;
+        }
+      });
+    };
 
-          if (statusStr.contains('connected')) {
-            if (connectedClientId != null) {
-              for (var client in clients) {
-                if (client.id == connectedClientId) {
-                  client.connected = true;
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('Connected to ${client.name}')),
-                  );
-                }
-              }
+    _vpnService.onConnectionChanged = (connected) {
+      setState(() {
+        if (connected && connectedClientId != null) {
+          for (var client in clients) {
+            if (client.id == connectedClientId) {
+              client.connected = true;
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Connected to ${client.name}')),
+              );
             }
-            setState(() => loading = false);
-          } else if (statusStr.contains('disconnected')) {
-            for (var client in clients) {
-              client.connected = false;
-            }
-            connectedClientId = null;
-            setState(() => loading = false);
           }
-
-          if (statusStr.contains('auth failed') || 
-              statusStr.contains('auth-failure')) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Authentication failed. Please check your username and password.'),
-                backgroundColor: Colors.red,
-              ),
-            );
-            setState(() {
-              loading = false;
-              isAuthenticating = false;
-              for (var client in clients) {
-                client.connected = false;
-              }
-            });
-          } else if (statusStr.contains('error') ||
-                   statusStr.contains('failed') ||
-                   statusStr.contains('fatal') ||
-                   statusStr.contains('exiting')) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('VPN Error: $status'),
-                backgroundColor: Colors.red,
-              ),
-            );
-            setState(() {
-              loading = false;
-              isAuthenticating = false;
-              for (var client in clients) {
-                client.connected = false;
-              }
-            });
+        } else {
+          for (var client in clients) {
+            client.connected = false;
           }
-        });
-      },
-      onVpnStageChanged: (data, raw) {
-        print('VPN Stage Changed: $data, Raw: $raw');
-        setState(() {
-          stage = data.toString();
-        });
-      },
-    );
-    openvpn.initialize();
+          connectedClientId = null;
+        }
+        loading = false;
+      });
+    };
   }
 
   Future<void> _getCurrentIpAddress() async {
@@ -179,15 +131,17 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
   }
 
   Future<void> _requestNotificationPermission() async {
-    if (await Permission.notification.isDenied) {
-      await Permission.notification.request();
+    if (Platform.isAndroid) {
+      if (await Permission.notification.isDenied) {
+        await Permission.notification.request();
+      }
     }
   }
 
   Future<void> fetchClients() async {
     setState(() => loading = true);
     try {
-      final response = await http.get(Uri.parse('${backendUrl}/api/vpn_connect/clients/'));
+      final response = await http.get(Uri.parse('${backendUrl}/api/vpn_connect/configs/'));
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body);
         setState(() {
@@ -209,7 +163,7 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
 
   Future<String?> downloadOvpnFile(VPNClient client) async {
     try {
-      final response = await http.get(Uri.parse('${backendUrl}/api/vpn_connect/ovpn-content/${client.id}/'));
+      final response = await http.get(Uri.parse('${backendUrl}/api/vpn_connect/configs/${client.id}/'));
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         final content = data['content'];
@@ -236,39 +190,21 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
     }
 
     try {
-      if (Platform.isAndroid) {
-        String config = await File(filePath).readAsString();
-        setState(() {
-          loading = true;
-        });
-        connectedClientId = client.id;
-        
-        try {
-          await openvpn.connect(
-            config,
-            client.name,
-            username: null,
-            password: null,
-            certIsRequired: true,
-          );
-        } catch (vpnError) {
-          print('Error in OpenVPN.connect(): $vpnError');
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('VPN connection error: $vpnError'),
-              backgroundColor: Colors.red,
-            ),
-          );
-          setState(() {
-            loading = false;
-            client.connected = false;
-          });
-        }
-      } else if (Platform.isWindows) {
-        await _connectWindowsVPN(client, filePath);
-      } else if (Platform.isLinux) {
-        await _connectLinuxVPN(client, filePath);
-      }
+      setState(() {
+        loading = true;
+      });
+      connectedClientId = client.id;
+      
+      String config = await File(filePath).readAsString();
+      await _vpnService.connect(config, client.name);
+      
+      // Save connection info
+      await _prefs.setString('current_vpn', client.name);
+      await _prefs.setString('vpn_config_path', filePath);
+      
+      // Update IP address
+      await _getCurrentIpAddress();
+      
     } catch (e) {
       print('Error in connectVPN: $e');
       ScaffoldMessenger.of(context).showSnackBar(
@@ -284,242 +220,12 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
     }
   }
 
-  Future<void> _connectWindowsVPN(VPNClient client, String filePath) async {
-    setState(() {
-      loading = true;
-    });
-
-    try {
-      // Read the OVPN file content
-      final config = await File(filePath).readAsString();
-      print('OVPN Config content: $config'); // Debug log
-      
-      // Extract VPN configuration
-      final serverAddress = _extractServerAddress(config);
-      final serverPort = _extractServerPort(config);
-      final protocol = _extractProtocol(config);
-      
-      print('Extracted VPN config - Server: $serverAddress, Port: $serverPort, Protocol: $protocol'); // Debug log
-      
-      if (serverAddress == null || serverPort == null) {
-        throw Exception('Could not extract server information from OVPN file');
-      }
-
-      // First, check if the VPN connection already exists
-      final checkResult = await Process.run('rasdial', []);
-      print('Existing VPN connections: ${checkResult.stdout}'); // Debug log
-
-      // Create VPN connection using rasdial
-      print('Attempting to create VPN connection...'); // Debug log
-      final result = await Process.run('rasdial', [
-        client.name,
-        serverAddress,
-        '/phonebook:${client.name}.pbk',
-        '/port:$serverPort'
-      ]);
-
-      print('rasdial result - Exit code: ${result.exitCode}'); // Debug log
-      print('rasdial stdout: ${result.stdout}'); // Debug log
-      print('rasdial stderr: ${result.stderr}'); // Debug log
-
-      if (result.exitCode != 0) {
-        // Try alternative connection method
-        print('Trying alternative connection method...'); // Debug log
-        final altResult = await Process.run('rasdial', [
-          client.name,
-          serverAddress
-        ]);
-
-        print('Alternative method result - Exit code: ${altResult.exitCode}'); // Debug log
-        print('Alternative method stdout: ${altResult.stdout}'); // Debug log
-        print('Alternative method stderr: ${altResult.stderr}'); // Debug log
-
-        if (altResult.exitCode != 0) {
-          throw Exception('Failed to create VPN connection: ${altResult.stderr}');
-        }
-      }
-
-      // Verify connection
-      await Future.delayed(const Duration(seconds: 5));
-      final verifyResult = await Process.run('rasdial', []);
-      print('Verification - Current connections: ${verifyResult.stdout}'); // Debug log
-
-      if (verifyResult.stdout.toString().contains(client.name)) {
-        setState(() {
-          client.connected = true;
-          connectedClientId = client.id;
-        });
-        
-        // Save connection info
-        await _prefs.setString('current_vpn', client.name);
-        await _prefs.setString('vpn_config_path', filePath);
-        
-        // Update IP address
-        await _getCurrentIpAddress();
-        
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Successfully connected to ${client.name}'),
-            backgroundColor: Colors.green,
-          ),
-        );
-      } else {
-        throw Exception('VPN connection verification failed');
-      }
-      
-    } catch (e) {
-      print('Error starting Windows VPN: $e'); // Debug log
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Failed to start VPN: $e'),
-          backgroundColor: Colors.red,
-          duration: const Duration(seconds: 10),
-          action: SnackBarAction(
-            label: 'Run as Admin',
-            onPressed: () async {
-              try {
-                final result = await Process.run('powershell', [
-                  '-Command',
-                  'Start-Process -FilePath "${Platform.resolvedExecutable}" -Verb RunAs'
-                ]);
-                print('Restart as admin result: ${result.exitCode}'); // Debug log
-                if (result.exitCode != 0) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Failed to restart as administrator'),
-                      backgroundColor: Colors.red,
-                    ),
-                  );
-                }
-              } catch (e) {
-                print('Error restarting as admin: $e'); // Debug log
-              }
-            },
-          ),
-        ),
-      );
-      setState(() {
-        client.connected = false;
-      });
-    } finally {
-      setState(() {
-        loading = false;
-      });
-    }
-  }
-
-  Future<void> _connectLinuxVPN(VPNClient client, String filePath) async {
-    setState(() {
-      loading = true;
-    });
-
-    try {
-      // Check if OpenVPN is installed
-      final result = await Process.run('which', ['openvpn']);
-      if (result.exitCode != 0) {
-        throw Exception('OpenVPN is not installed. Please install it using your package manager.');
-      }
-
-      // Start OpenVPN process
-      final process = await Process.start(
-        'sudo',
-        ['openvpn', '--config', filePath],
-        mode: ProcessStartMode.detached,
-      );
-
-      // Wait for connection
-      await Future.delayed(const Duration(seconds: 5));
-      
-      // Check if process is still running
-      if (await process.exitCode == null) {
-        setState(() {
-          client.connected = true;
-          connectedClientId = client.id;
-        });
-        
-        // Save connection info
-        await _prefs.setString('current_vpn', client.name);
-        await _prefs.setString('vpn_config_path', filePath);
-        
-        // Update IP address
-        await _getCurrentIpAddress();
-      } else {
-        throw Exception('VPN connection failed');
-      }
-    } catch (e) {
-      print('Error starting Linux VPN: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Failed to start VPN: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
-      setState(() {
-        client.connected = false;
-      });
-    } finally {
-      setState(() {
-        loading = false;
-      });
-    }
-  }
-
-  String? _extractServerAddress(String config) {
-    final remoteMatch = RegExp(r'remote\s+([^\s]+)').firstMatch(config);
-    return remoteMatch?.group(1);
-  }
-
-  int? _extractServerPort(String config) {
-    final remoteMatch = RegExp(r'remote\s+[^\s]+\s+(\d+)').firstMatch(config);
-    return remoteMatch != null ? int.tryParse(remoteMatch.group(1)!) : null;
-  }
-
-  String? _extractProtocol(String config) {
-    if (config.contains('proto udp')) return 'udp';
-    if (config.contains('proto tcp')) return 'tcp';
-    return null;
-  }
-
   Future<void> disconnectVPN(VPNClient client) async {
     setState(() {
       loading = true;
     });
     try {
-      if (Platform.isAndroid) {
-        openvpn.disconnect();
-      } else if (Platform.isWindows) {
-        print('Attempting to disconnect VPN...'); // Debug log
-        final result = await Process.run('rasdial', [
-          client.name,
-          '/disconnect'
-        ]);
-        
-        print('Disconnect result - Exit code: ${result.exitCode}'); // Debug log
-        print('Disconnect stdout: ${result.stdout}'); // Debug log
-        print('Disconnect stderr: ${result.stderr}'); // Debug log
-        
-        if (result.exitCode != 0) {
-          // Try alternative disconnect method
-          print('Trying alternative disconnect method...'); // Debug log
-          final altResult = await Process.run('rasdial', [
-            client.name,
-            '/disconnect',
-            '/force'
-          ]);
-          
-          print('Alternative disconnect result - Exit code: ${altResult.exitCode}'); // Debug log
-          if (altResult.exitCode != 0) {
-            throw Exception('Failed to disconnect VPN: ${altResult.stderr}');
-          }
-        }
-      } else if (Platform.isLinux) {
-        await Process.run('sudo', ['pkill', '-f', 'openvpn']);
-      }
-      
-      setState(() {
-        client.connected = false;
-        connectedClientId = null;
-      });
+      await _vpnService.disconnect();
       
       // Clear saved connection info
       await _prefs.remove('current_vpn');
@@ -537,33 +243,11 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
         ),
       );
     } catch (e) {
-      print('Error disconnecting VPN: $e'); // Debug log
+      print('Error disconnecting VPN: $e');
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('Failed to stop VPN: $e'),
-          duration: const Duration(seconds: 10),
-          action: SnackBarAction(
-            label: 'Run as Admin',
-            onPressed: () async {
-              try {
-                final result = await Process.run('powershell', [
-                  '-Command',
-                  'Start-Process -FilePath "${Platform.resolvedExecutable}" -Verb RunAs'
-                ]);
-                print('Restart as admin result: ${result.exitCode}'); // Debug log
-                if (result.exitCode != 0) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Failed to restart as administrator'),
-                      backgroundColor: Colors.red,
-                    ),
-                  );
-                }
-              } catch (e) {
-                print('Error restarting as admin: $e'); // Debug log
-              }
-            },
-          ),
+          backgroundColor: Colors.red,
         ),
       );
     } finally {
@@ -646,13 +330,17 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('VPN Clients'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: fetchClients,
-          ),
-        ],
+        title: Row(
+          children: [
+            const Expanded(
+              child: Text('VPN Clients', overflow: TextOverflow.ellipsis),
+            ),
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: fetchClients,
+            ),
+          ],
+        ),
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: uploadOvpnFile,
@@ -681,6 +369,36 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
                 )
               : Column(
                   children: [
+                    Container(
+                      padding: const EdgeInsets.all(8.0),
+                      color: status.toLowerCase().contains('connected') 
+                          ? Colors.green.withOpacity(0.2) 
+                          : Colors.red.withOpacity(0.2),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            status.toLowerCase().contains('connected')
+                                ? Icons.vpn_lock
+                                : Icons.vpn_lock_outlined,
+                            color: status.toLowerCase().contains('connected')
+                                ? Colors.green
+                                : Colors.red,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            'VPN Status: $status',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                              color: status.toLowerCase().contains('connected')
+                                  ? Colors.green
+                                  : Colors.red,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                     if (_currentIpAddress != null)
                       Padding(
                         padding: const EdgeInsets.all(8.0),
@@ -727,19 +445,7 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
 
   @override
   void dispose() {
-    // Clean up any temporary credential files
-    if (Platform.isAndroid) {
-      Directory(Directory.systemTemp.path)
-          .listSync()
-          .where((file) => file.path.endsWith('_credentials'))
-          .forEach((file) {
-        try {
-          file.deleteSync();
-        } catch (e) {
-          print('Error cleaning up credential file: $e');
-        }
-      });
-    }
+    _vpnService.disconnect();
     super.dispose();
   }
 }
