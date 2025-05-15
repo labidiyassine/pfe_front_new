@@ -4,14 +4,16 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:openvpn_flutter/openvpn_flutter.dart';
+// Conditionally import OpenVPN for Android only
 import 'package:permission_handler/permission_handler.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'dart:async';
-import 'dart:ffi' if (dart.library.io) 'dart:io' show Platform;
+import 'dart:ffi';
 import 'services/vpn_service.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 
 void main() {
   runApp(const MyApp());
@@ -66,15 +68,27 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
   final NetworkInfo _networkInfo = NetworkInfo();
   String? _currentIpAddress;
   final VPNService _vpnService = VPNService();
+  bool _isPlatformSupported = true;
+  Timer? _ipRefreshTimer;
 
   @override
   void initState() {
     super.initState();
     _initPrefs();
-    fetchClients();
     _initVPN();
-    _requestNotificationPermission();
+    _requestPermissions();
     _getCurrentIpAddress();
+    fetchClients();
+    
+    // Start IP refresh timer
+    _ipRefreshTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
+      if (_vpnService.isConnected) {
+        _getCurrentIpAddress();
+      }
+      
+      // Also periodically sync connection states
+      _syncConnectionStates();
+    });
   }
 
   Future<void> _initPrefs() async {
@@ -82,41 +96,133 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
   }
 
   Future<void> _initVPN() async {
-    await _vpnService.initialize();
-    _vpnService.onStatusChanged = (status) {
-      setState(() {
-        this.status = status;
-        if (status.toLowerCase().contains('authenticat')) {
-          isAuthenticating = true;
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Authenticating...')),
-          );
-        } else {
-          isAuthenticating = false;
-        }
-      });
-    };
-
-    _vpnService.onConnectionChanged = (connected) {
-      setState(() {
-        if (connected && connectedClientId != null) {
+    try {
+      if (!Platform.isAndroid && !Platform.isWindows && !Platform.isLinux) {
+        setState(() {
+          _isPlatformSupported = false;
+          status = "Platform not supported";
+        });
+        return;
+      }
+      
+      await _vpnService.initialize();
+      
+      _vpnService.onStatusChanged = (status) {
+        setState(() {
+          this.status = status;
+          if (status.toLowerCase().contains('authenticat')) {
+            isAuthenticating = true;
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Authenticating...')),
+            );
+          } else {
+            isAuthenticating = false;
+          }
+          
+          // Check for TAP adapter errors
+          if (status.toLowerCase().contains('tap') && 
+              (status.toLowerCase().contains('in use') || 
+               status.toLowerCase().contains('disabled') ||
+               status.toLowerCase().contains('failure'))) {
+            
+            // Show a more specific message for TAP adapter issues
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: const Text('TAP adapter issue detected. Try restarting the app with admin rights.'),
+                duration: const Duration(seconds: 10),
+                action: SnackBarAction(
+                  label: 'Dismiss',
+                  onPressed: () {
+                    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+                  },
+                ),
+              ),
+            );
+            
+            // Reset connection state and UI
+            _resetConnectionState();
+          }
+          
+          // Check for errors in status that might indicate a failed connection
+          if ((status.toLowerCase().contains('error') || 
+               status.toLowerCase().contains('failed') ||
+               status.toLowerCase().contains('critical')) &&
+              !status.toLowerCase().contains('warning')) {
+            // If we detect a serious error, sync the states to ensure UI accurately reflects it
+            _syncConnectionStates();
+          }
+        });
+      };
+      
+      _vpnService.onConnectionChanged = (connected) {
+        setState(() {
+          loading = false;
+          status = connected ? "Connected" : "Disconnected";
+          
+          // Update all clients to reflect the current connection state
           for (var client in clients) {
-            if (client.id == connectedClientId) {
+            // If we're connected, only the selected client should show as connected
+            if (connected && client.id == connectedClientId) {
               client.connected = true;
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text('Connected to ${client.name}')),
-              );
+            } else {
+              client.connected = false;
             }
           }
-        } else {
-          for (var client in clients) {
-            client.connected = false;
+          
+          // If we're disconnected, clear the connected client ID
+          if (!connected) {
+            connectedClientId = null;
           }
-          connectedClientId = null;
+        });
+      };
+      
+    } catch (e) {
+      print('VPN initialization error: $e');
+      
+      // Handle initialization errors differently on Windows/Linux
+      if (Platform.isWindows || Platform.isLinux) {
+        setState(() {
+          status = "Limited functionality on ${Platform.operatingSystem}";
+        });
+        
+        // Only show dialog for severe errors
+        if (e.toString().contains('critical') || 
+            e.toString().contains('permission')) {
+          _showError('VPN Setup Error', e.toString());
         }
-        loading = false;
-      });
-    };
+      } else {
+        _showError('Error', e.toString());
+      }
+    }
+  }
+  
+  void _showError(String title, String message) {
+    // Use Future.microtask to avoid showing dialog during build
+    Future.microtask(() {
+      if (mounted) {
+      showDialog(
+        context: context,
+        builder: (BuildContext context) {
+          return AlertDialog(
+              title: Text(title),
+              content: Text(message),
+            actions: [
+              TextButton(
+                child: const Text('OK'),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
+            ],
+          );
+        },
+      );
+    }
+    });
+  }
+
+  Future<void> _requestPermissions() async {
+    if (Platform.isAndroid) {
+      await Permission.notification.request();
+    }
   }
 
   Future<void> _getCurrentIpAddress() async {
@@ -127,14 +233,6 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
       });
     } catch (e) {
       print('Error getting IP address: $e');
-    }
-  }
-
-  Future<void> _requestNotificationPermission() async {
-    if (Platform.isAndroid) {
-      if (await Permission.notification.isDenied) {
-        await Permission.notification.request();
-      }
     }
   }
 
@@ -180,50 +278,167 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
     }
   }
 
-  Future<void> connectVPN(VPNClient client) async {
-    final filePath = await downloadOvpnFile(client);
-    if (filePath == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Failed to download .ovpn file')),
-      );
-      return;
-    }
+  // Reset connection state after errors
+  void _resetConnectionState() {
+    setState(() {
+      loading = false;
+      status = "Disconnected";
+      
+      // Update all clients to show as disconnected
+      for (var client in clients) {
+        client.connected = false;
+      }
+      
+      connectedClientId = null;
+    });
+  }
 
+  // Synchronize UI toggle states with actual VPN connection state
+  void _syncConnectionStates() {
+    // If loading, don't try to sync states to avoid UI flicker
+    if (loading) return;
+    
+    bool vpnConnected = _vpnService.isConnected;
+    
+    setState(() {
+      // Update the global status indicator
+      if (vpnConnected) {
+        status = "Connected";
+        
+        // If VPN is connected but no client is marked as connected,
+        // try to find the last connected client from preferences
+        if (connectedClientId == null) {
+          String? lastVpn = _prefs.getString('current_vpn');
+          if (lastVpn != null) {
+            for (var client in clients) {
+              if (client.name == lastVpn) {
+                connectedClientId = client.id;
+                client.connected = true;
+                break;
+              }
+            }
+          }
+        }
+      } else if (!status.contains("Error") && !status.contains("Failed") &&
+                !status.contains("TAP")) {  // Don't override error messages
+        status = "Disconnected";
+        // Reset all clients to disconnected state
+        for (var client in clients) {
+          client.connected = false;
+        }
+        connectedClientId = null;
+      }
+      
+      // Make sure toggle states match the connection state
+      bool foundConnectedClient = false;
+      for (var client in clients) {
+        if (vpnConnected && client.id == connectedClientId) {
+          client.connected = true;
+          foundConnectedClient = true;
+        } else {
+          client.connected = false;
+        }
+      }
+      
+      // If VPN is connected but no client is marked as connected, force disconnect
+      if (vpnConnected && !foundConnectedClient) {
+        _vpnService.disconnect();
+      }
+    });
+  }
+
+  Future<void> connectVPN(VPNClient client) async {
     try {
       setState(() {
         loading = true;
+        status = "Connecting...";
       });
+      
+      // First disconnect any existing connection
+      if (_vpnService.isConnected) {
+        await _vpnService.disconnect();
+      }
+      
+      final filePath = await downloadOvpnFile(client);
+      if (filePath == null) {
+        throw Exception('Failed to download .ovpn file');
+      }
+  
+      // Set this client as the one being connected
       connectedClientId = client.id;
+
+      // Update UI to show this client is being connected
+      setState(() {
+        for (var c in clients) {
+          c.connected = c.id == client.id;
+        }
+      });
       
       String config = await File(filePath).readAsString();
+      
       await _vpnService.connect(config, client.name);
       
       // Save connection info
       await _prefs.setString('current_vpn', client.name);
       await _prefs.setString('vpn_config_path', filePath);
       
-      // Update IP address
-      await _getCurrentIpAddress();
+      // Wait a moment before refreshing IP to allow connection to establish
+      if (_vpnService.isConnected) {
+        await Future.delayed(const Duration(seconds: 5));
+        await _getCurrentIpAddress();
+      }
+      
+      // Make sure UI is in sync with connection state
+      _syncConnectionStates();
       
     } catch (e) {
       print('Error in connectVPN: $e');
+      
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Failed to start VPN: $e'),
-          backgroundColor: Colors.red,
+          content: Text('Connection failed: ${e.toString()}'),
+          duration: const Duration(seconds: 10),
+          action: SnackBarAction(
+            label: 'Dismiss',
+            onPressed: () {
+              ScaffoldMessenger.of(context).hideCurrentSnackBar();
+            },
+          ),
         ),
       );
+      
       setState(() {
         loading = false;
-        client.connected = false;
+        // Reset connection status for all clients
+        for (var c in clients) {
+          c.connected = false;
+        }
+        connectedClientId = null;
+        status = "Connection failed";
       });
+      
+      // Make sure UI is in sync with connection state
+      _syncConnectionStates();
     }
   }
 
   Future<void> disconnectVPN(VPNClient client) async {
+    // If we're already disconnecting, don't try again
+    if (status.toLowerCase() == "disconnecting...") {
+      return;
+    }
+    
+    // If client isn't actually shown as connected, fix the state instead of doing a disconnect
+    if (!client.connected) {
+      _syncConnectionStates();
+      return;
+    }
+    
     setState(() {
       loading = true;
+      status = "Disconnecting...";
     });
+    
     try {
       await _vpnService.disconnect();
       
@@ -231,10 +446,18 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
       await _prefs.remove('current_vpn');
       await _prefs.remove('vpn_config_path');
       
-      // Update IP address
+      // Update IP address after a short delay
+      await Future.delayed(const Duration(seconds: 3));
       await _getCurrentIpAddress();
       
-      await fetchClients();
+      setState(() {
+        // Ensure all clients show as disconnected
+        for (var c in clients) {
+          c.connected = false;
+        }
+        connectedClientId = null;
+        status = "Disconnected";
+      });
       
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -244,16 +467,26 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
       );
     } catch (e) {
       print('Error disconnecting VPN: $e');
+      
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('Failed to stop VPN: $e'),
           backgroundColor: Colors.red,
         ),
       );
+      
+      // Even if disconnect fails, update UI to show disconnected
+      _resetConnectionState();
+      
+      // Refresh client list to make sure UI is in sync
+      fetchClients();
     } finally {
       setState(() {
         loading = false;
       });
+      
+      // Make sure UI is in sync with connection state
+      _syncConnectionStates();
     }
   }
 
@@ -331,9 +564,13 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
     return Scaffold(
       appBar: AppBar(
         title: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             const Expanded(
-              child: Text('VPN Clients', overflow: TextOverflow.ellipsis),
+              child: Text(
+                'VPN Clients',
+                overflow: TextOverflow.ellipsis,
+              ),
             ),
             IconButton(
               icon: const Icon(Icons.refresh),
@@ -347,68 +584,78 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
         tooltip: 'Upload .ovpn file',
         child: const Icon(Icons.upload_file),
       ),
-      body: loading || isAuthenticating
-          ? const Center(child: CircularProgressIndicator())
-          : clients.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Text(
-                        'No VPN clients found',
-                        style: TextStyle(fontSize: 18),
-                      ),
-                      const SizedBox(height: 20),
-                      ElevatedButton.icon(
-                        onPressed: uploadOvpnFile,
-                        icon: const Icon(Icons.upload_file),
-                        label: const Text('Upload .ovpn file'),
-                      ),
-                    ],
-                  ),
-                )
-              : Column(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(8.0),
-                      color: status.toLowerCase().contains('connected') 
-                          ? Colors.green.withOpacity(0.2) 
-                          : Colors.red.withOpacity(0.2),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(
-                            status.toLowerCase().contains('connected')
-                                ? Icons.vpn_lock
-                                : Icons.vpn_lock_outlined,
-                            color: status.toLowerCase().contains('connected')
-                                ? Colors.green
-                                : Colors.red,
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            'VPN Status: $status',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                              color: status.toLowerCase().contains('connected')
-                                  ? Colors.green
-                                  : Colors.red,
-                            ),
-                          ),
-                        ],
-                      ),
+      body: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8.0),
+            color: status.toLowerCase().contains('connected') 
+                ? Colors.green.withOpacity(0.2) 
+                : Colors.red.withOpacity(0.2),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  status.toLowerCase().contains('connected')
+                      ? Icons.vpn_lock
+                      : Icons.vpn_lock_outlined,
+                  color: status.toLowerCase().contains('connected')
+                      ? Colors.green
+                      : Colors.red,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'VPN Status: $status',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: status.toLowerCase().contains('connected')
+                          ? Colors.green
+                          : Colors.red,
                     ),
-                    if (_currentIpAddress != null)
-                      Padding(
-                        padding: const EdgeInsets.all(8.0),
-                        child: Text(
-                          'Current IP: $_currentIpAddress',
-                          style: const TextStyle(fontSize: 16),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (status.toLowerCase().contains('connected'))
+                  IconButton(
+                    icon: const Icon(Icons.refresh),
+                    onPressed: _getCurrentIpAddress,
+                    tooltip: 'Refresh IP',
+                    color: Colors.green,
+                ),
+              ],
+            ),
+          ),
+          if (_currentIpAddress != null)
+            Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: Text(
+                'Current IP: $_currentIpAddress',
+                style: const TextStyle(fontSize: 16),
+              ),
+            ),
+          Expanded(
+            child: loading
+                ? const Center(child: CircularProgressIndicator())
+                : clients.isEmpty
+                    ? Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const Text(
+                              'No VPN clients found',
+                              style: TextStyle(fontSize: 18),
+                            ),
+                            const SizedBox(height: 20),
+                            ElevatedButton.icon(
+                              onPressed: uploadOvpnFile,
+                              icon: const Icon(Icons.upload_file),
+                              label: const Text('Upload .ovpn file'),
+                            ),
+                          ],
                         ),
-                      ),
-                    Expanded(
-                      child: RefreshIndicator(
+                      )
+                    : RefreshIndicator(
                         onRefresh: fetchClients,
                         child: ListView.builder(
                           itemCount: clients.length,
@@ -424,28 +671,34 @@ class _VPNClientListPageState extends State<VPNClientListPage> {
                                 subtitle: Text(client.connected ? 'Connected' : 'Disconnected'),
                                 trailing: Switch(
                                   value: client.connected,
-                                  onChanged: (val) async {
-                                    if (val) {
-                                      await connectVPN(client);
-                                    } else {
-                                      await disconnectVPN(client);
-                                    }
-                                  },
+                                  // Disable the switch during loading state or for other clients when one is connected
+                                  onChanged: loading || (connectedClientId != null && connectedClientId != client.id && !client.connected) 
+                                    ? null 
+                                    : (val) async {
+                                        if (val) {
+                                          await connectVPN(client);
+                                        } else {
+                                          await disconnectVPN(client);
+                                        }
+                                      },
+                                  activeColor: loading ? Colors.grey : Colors.green,
+                                  inactiveThumbColor: loading ? Colors.grey : null,
                                 ),
                               ),
                             );
                           },
                         ),
                       ),
-                    ),
-                  ],
-                ),
+          ),
+        ],
+      ),
     );
   }
 
   @override
   void dispose() {
     _vpnService.disconnect();
+    _ipRefreshTimer?.cancel();
     super.dispose();
   }
 }
